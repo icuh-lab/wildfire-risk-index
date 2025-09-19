@@ -62,29 +62,19 @@ sigungu_codes = [
 def main():
     load_dotenv()
 
-    # ... (ssh 및 db 정보 로드 부분은 기존과 동일) ...
-    ssh_host = os.getenv("SSH_HOST")
-    ssh_port = int(os.getenv("SSH_PORT"))
-    ssh_user = os.getenv("SSH_USER")
-    ssh_pkey = os.getenv("SSH_PKEY")
-
-    db_host = os.getenv("DB_HOST")
-    db_port = int(os.getenv("DB_PORT"))
-    db_user = os.getenv("DB_USER")
-    db_password = os.getenv("DB_PASSWORD")
-    db_name = os.getenv("DB_NAME")
+    env = os.getenv("EXECUTION_ENV", "local")
+    print(f"--- 실행 환경: {env} ---")
 
     try:
-        with SSHTunnelForwarder(
-                (ssh_host, ssh_port),
-                ssh_username=ssh_user,
-                ssh_pkey=ssh_pkey,
-                remote_bind_address=(db_host, db_port)
-        ) as server:
-            local_port = server.local_bind_port
-            print(f"SSH 터널이 생성되었습니다. (localhost:{local_port} -> {db_host}:{db_port})")
+        db_host = os.getenv("DB_HOST")
+        db_port = int(os.getenv("DB_PORT"))
+        db_user = os.getenv("DB_USER")
+        db_password = os.getenv("DB_PASSWORD")
+        db_name = os.getenv("DB_NAME")
 
-            conn_str = f'mysql+pymysql://{db_user}:{db_password}@127.0.0.1:{local_port}/{db_name}'
+        if env == "production":
+            print("운영 환경으로 판단하여 RDS에 직접 접속합니다.")
+            conn_str = f'mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}'
             engine = create_engine(conn_str)
 
             # for 반복문으로 각 지점 ID를 순회
@@ -93,10 +83,35 @@ def main():
 
                 if wildfire_risk_data_json:
                     insert_data_to_db(wildfire_risk_data_json, engine)
+        else:
+            print("로컬 환경으로 판단하여 SSH 터널링을 시작합니다.")
+
+            ssh_host = os.getenv("SSH_HOST")
+            ssh_port = int(os.getenv("SSH_PORT"))
+            ssh_user = os.getenv("SSH_USER")
+            ssh_pkey = os.getenv("SSH_PKEY")
+
+            with SSHTunnelForwarder(
+                    (ssh_host, ssh_port),
+                    ssh_username=ssh_user,
+                    ssh_pkey=ssh_pkey,
+                    remote_bind_address=(db_host, db_port)
+            ) as server:
+                local_port = server.local_bind_port
+                print(f"SSH 터널이 생성되었습니다. (localhost:{local_port} -> {db_host}:{db_port})")
+
+                conn_str = f'mysql+pymysql://{db_user}:{db_password}@127.0.0.1:{local_port}/{db_name}'
+                engine = create_engine(conn_str)
+
+                # for 반복문으로 각 지점 ID를 순회
+                for sigungu_code in sigungu_codes:
+                    wildfire_risk_data_json = fetch_wildfire_risk_data(sigungu_code)
+
+                    if wildfire_risk_data_json:
+                        insert_data_to_db(wildfire_risk_data_json, engine)
 
     except Exception as e:
         print(f"!! 전체 프로세스 실행 중 오류가 발생했습니다: {e}")
-        # raise e # 디버깅 시 주석 해제하여 상세 오류 확인
 
 if __name__ == "__main__":
     main()
