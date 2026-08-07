@@ -1,7 +1,7 @@
 import os
+import sys
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
-from sshtunnel import SSHTunnelForwarder
 
 from src.crawler import fetch_wildfire_risk_data
 from src.insert_to_db import insert_data_to_db
@@ -59,11 +59,56 @@ sigungu_codes = [
 ]
 
 
+def get_sigungu_codes():
+    override_codes = os.getenv("SIGUNGU_CODES")
+    if override_codes:
+        raw_codes = [code.strip() for code in override_codes.split(",")]
+    else:
+        raw_codes = sigungu_codes
+
+    seen = set()
+    filtered_codes = []
+    for code in raw_codes:
+        if not code or code in seen or code.endswith("000"):
+            continue
+        seen.add(code)
+        filtered_codes.append(code)
+    return filtered_codes
+
+
+def is_enabled(value):
+    return str(value).lower() in {"1", "true", "yes", "y"}
+
+
+def create_db_engine(host, port, user, password, database):
+    conn_str = f'mysql+pymysql://{user}:{password}@{host}:{port}/{database}'
+    return create_engine(conn_str, pool_pre_ping=True)
+
+
+def collect_and_insert(engine, codes, dry_run=False):
+    total_inserted = 0
+    total_failed = 0
+
+    for sigungu_code in codes:
+        wildfire_risk_data_json = fetch_wildfire_risk_data(sigungu_code)
+
+        if wildfire_risk_data_json:
+            total_inserted += insert_data_to_db(wildfire_risk_data_json, engine, dry_run=dry_run)
+        else:
+            total_failed += 1
+
+    print(f"처리 완료: 대상={len(codes)}, 실패={total_failed}, 신규 적재={total_inserted}, dry_run={dry_run}")
+    return total_inserted, total_failed
+
+
 def main():
     load_dotenv()
 
     env = os.getenv("EXECUTION_ENV", "local")
+    dry_run = is_enabled(os.getenv("DRY_RUN", "false"))
+    codes = get_sigungu_codes()
     print(f"--- 실행 환경: {env} ---")
+    print(f"--- 처리 대상 시군구 수: {len(codes)}, dry_run={dry_run} ---")
 
     try:
         db_host = os.getenv("DB_HOST")
@@ -74,17 +119,11 @@ def main():
 
         if env == "production":
             print("운영 환경으로 판단하여 RDS에 직접 접속합니다.")
-            conn_str = f'mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}'
-            engine = create_engine(conn_str)
-
-            # for 반복문으로 각 지점 ID를 순회
-            for sigungu_code in sigungu_codes:
-                wildfire_risk_data_json = fetch_wildfire_risk_data(sigungu_code)
-
-                if wildfire_risk_data_json:
-                    insert_data_to_db(wildfire_risk_data_json, engine)
+            engine = create_db_engine(db_host, db_port, db_user, db_password, db_name)
+            collect_and_insert(engine, codes, dry_run=dry_run)
         else:
             print("로컬 환경으로 판단하여 SSH 터널링을 시작합니다.")
+            from sshtunnel import SSHTunnelForwarder
 
             ssh_host = os.getenv("SSH_HOST")
             ssh_port = int(os.getenv("SSH_PORT"))
@@ -100,18 +139,12 @@ def main():
                 local_port = server.local_bind_port
                 print(f"SSH 터널이 생성되었습니다. (localhost:{local_port} -> {db_host}:{db_port})")
 
-                conn_str = f'mysql+pymysql://{db_user}:{db_password}@127.0.0.1:{local_port}/{db_name}'
-                engine = create_engine(conn_str)
-
-                # for 반복문으로 각 지점 ID를 순회
-                for sigungu_code in sigungu_codes:
-                    wildfire_risk_data_json = fetch_wildfire_risk_data(sigungu_code)
-
-                    if wildfire_risk_data_json:
-                        insert_data_to_db(wildfire_risk_data_json, engine)
+                engine = create_db_engine('127.0.0.1', local_port, db_user, db_password, db_name)
+                collect_and_insert(engine, codes, dry_run=dry_run)
 
     except Exception as e:
         print(f"!! 전체 프로세스 실행 중 오류가 발생했습니다: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

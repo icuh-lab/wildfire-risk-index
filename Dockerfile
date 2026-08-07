@@ -1,5 +1,7 @@
 FROM python:3.12.11
 
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /workspace/app
 
 COPY requirements.txt ./
