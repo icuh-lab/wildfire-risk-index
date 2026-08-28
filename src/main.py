@@ -3,77 +3,59 @@ import sys
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
 
-from src.crawler import fetch_wildfire_risk_data
-from src.insert_to_db import insert_data_to_db
-
-sigungu_codes = [
-    "11000", "11110", "11140", "11170", "11200", "11215", "11230", "11230", "11260", "11290",
-    "11305", "11320", "11350", "11410", "11440", "11470", "11500", "11530", "11545", "11560",
-    "11590", "11620", "11650", "11680", "11710", "11740",
-
-    "26000", "26110", "26140", "26170", "26200", "26230", "26260", "26290", "26320", "26350",
-    "26380", "26410", "26440", "26470", "26500", "26530", "26710",
-
-    "27000", "27110", "27140", "27170", "27200", "27300", "27260", "27290", "27710", "27720",
-
-    "28000", "28110", "28140", "28177", "28185", "28200", "28237", "28245", "28260", "28271",
-    "28720",
-
-    "29000", "29110", "29140", "29155", "29170", "29200",
-
-    "30000", "30110", "30140", "30170", "30200", "30230",
-
-    "31000", "31110", "31140", "31170", "31200", "31710",
-
-    "36110",
-
-    "41000", "41110", "41130", "41150", "41170", "41190", "41210", "41220", "41250", "41270",
-    "41280", "41290", "41310", "41360", "41370", "41390", "41410", "41430", "41450", "41460",
-    "41480", "41500", "41550", "41570", "41590", "41610", "41630", "41650", "41670", "41800",
-    "41820", "41830",
-
-    "43000", "43110", "43130", "43150", "43720", "43730", "43740", "43745", "43750", "43760",
-    "43770", "43800",
-
-    "44000", "44130", "44150", "44180", "44200", "44210", "44230", "44250", "44270", "44710",
-    "44760", "44770", "44790", "44800", "44810", "44825",
-
-    "45000", "45110", "45130", "45140", "45180", "45190", "45210", "45710", "45720", "45730",
-    "45740", "45750", "45770", "45790", "45800",
-
-    "46000", "46110", "46130", "46150", "46170", "46230", "46710", "46720", "46730", "46770",
-    "46780", "46790", "46810", "46820", "46830", "46840", "46860", "46870", "46880", "46890",
-    "46900", "46910",
-
-    "47000", "47110", "47130", "47150", "47170", "47190", "47210", "47230", "47250", "47280",
-    "47290", "47730", "47750", "47760", "47770", "47820", "47830", "47840", "47850", "47900",
-    "47920", "47930", "47940",
-
-    "48000", "48120", "48170", "48220", "48240", "48250", "48270", "48310", "48330", "48720",
-    "48730", "48740", "48820", "48840", "48850", "48860", "48870", "48880", "48890",
-
-    "50000", "50110", "50130",
-
-    "51000", "51110", "51130", "51150", "51170", "51190", "51210", "51230", "51720", "51730",
-    "51750", "51760", "51770", "51780", "51790", "51800", "51810", "51820", "51830"
-]
+from src.crawler import fetch_all_items
+from src.insert_to_db import insert_items_to_db
 
 
-def get_sigungu_codes():
-    override_codes = os.getenv("SIGUNGU_CODES")
-    if override_codes:
-        raw_codes = [code.strip() for code in override_codes.split(",")]
-    else:
-        raw_codes = sigungu_codes
+# 원천(산림청 forestPointV2)이 현재 서비스하는 시군구는 16개 시도, 230개다.
+# 행정구역 개편으로 숫자가 오르내릴 수 있어 여유를 두었다.
+DEFAULT_MIN_EXPECTED_REGIONS = 200
+# 시군구 총수만으로는 시도 단위 누락을 못 잡는다.
+# 전남광주통합특별시(27개)가 통째로 빠져도 203개라 총수 기준을 통과해 버린다.
+DEFAULT_MIN_EXPECTED_SIDO = 16
 
-    seen = set()
-    filtered_codes = []
-    for code in raw_codes:
-        if not code or code in seen or code.endswith("000"):
-            continue
-        seen.add(code)
-        filtered_codes.append(code)
-    return filtered_codes
+
+class InsufficientCoverageError(Exception):
+    """원천이 기대보다 적은 시군구를 내려줬다. 행정구역 개편이나 원천 장애를 의심해야 한다."""
+
+
+def region_coverage(items):
+    """시도(시군구 코드 앞 2자리)별로 몇 개 시군구가 들어왔는지 센다."""
+    by_sido = {}
+    for code in {str(item["sigucode"]) for item in items if item.get("sigucode") is not None}:
+        by_sido[code[:2]] = by_sido.get(code[:2], 0) + 1
+    return by_sido
+
+
+def verify_coverage(items, minimum, minimum_sido=DEFAULT_MIN_EXPECTED_SIDO):
+    """
+    시군구·시도 커버리지를 확인하고 부족하면 예외를 던진다.
+
+    옛 수집기는 죽은 시군구 코드에 대해 원천이 resultCode=00 / totalCount=0을 돌려주면
+    "데이터가 비어있습니다"만 찍고 성공으로 끝냈다. 그래서 전남·광주·전북이 통째로
+    빠진 채 한 달 넘게 아무도 몰랐다. 부족하면 반드시 실패로 끝내야 한다.
+    """
+    coverage = region_coverage(items)
+    total_regions = sum(coverage.values())
+    total_sido = len(coverage)
+    detail = dict(sorted(coverage.items()))
+
+    print(f"커버리지: 시군구 {total_regions}개(기준 {minimum}), 시도 {total_sido}개(기준 {minimum_sido})")
+    print(f"  시도별: {detail}")
+
+    if total_regions < minimum:
+        raise InsufficientCoverageError(
+            f"수집된 시군구가 {total_regions}개로 기준 {minimum}개에 못 미친다. "
+            f"행정구역 개편으로 원천 코드가 바뀌었거나 원천이 부분 장애일 수 있다. 시도별: {detail}"
+        )
+
+    if total_sido < minimum_sido:
+        raise InsufficientCoverageError(
+            f"수집된 시도가 {total_sido}개로 기준 {minimum_sido}개에 못 미친다. "
+            f"시도 하나가 통째로 빠졌다. 시도별: {detail}"
+        )
+
+    return total_regions
 
 
 def is_enabled(value):
@@ -85,20 +67,16 @@ def create_db_engine(host, port, user, password, database):
     return create_engine(conn_str, pool_pre_ping=True)
 
 
-def collect_and_insert(engine, codes, dry_run=False):
-    total_inserted = 0
-    total_failed = 0
+def collect_and_insert(engine, dry_run=False, minimum_regions=DEFAULT_MIN_EXPECTED_REGIONS,
+                       minimum_sido=DEFAULT_MIN_EXPECTED_SIDO, items_fetcher=None):
+    """전국을 한 번에 받아 커버리지를 확인한 뒤 적재한다. 커버리지가 모자라면 적재하지 않는다."""
+    items = (items_fetcher or fetch_all_items)()
 
-    for sigungu_code in codes:
-        wildfire_risk_data_json = fetch_wildfire_risk_data(sigungu_code)
+    verify_coverage(items, minimum_regions, minimum_sido)
 
-        if wildfire_risk_data_json:
-            total_inserted += insert_data_to_db(wildfire_risk_data_json, engine, dry_run=dry_run)
-        else:
-            total_failed += 1
-
-    print(f"처리 완료: 대상={len(codes)}, 실패={total_failed}, 신규 적재={total_inserted}, dry_run={dry_run}")
-    return total_inserted, total_failed
+    inserted = insert_items_to_db(items, engine, dry_run=dry_run)
+    print(f"처리 완료: 수신={len(items)}행, 신규 적재={inserted}행, dry_run={dry_run}")
+    return inserted
 
 
 def main():
@@ -106,9 +84,9 @@ def main():
 
     env = os.getenv("EXECUTION_ENV", "local")
     dry_run = is_enabled(os.getenv("DRY_RUN", "false"))
-    codes = get_sigungu_codes()
-    print(f"--- 실행 환경: {env} ---")
-    print(f"--- 처리 대상 시군구 수: {len(codes)}, dry_run={dry_run} ---")
+    minimum_regions = int(os.getenv("MIN_EXPECTED_REGIONS", DEFAULT_MIN_EXPECTED_REGIONS))
+    minimum_sido = int(os.getenv("MIN_EXPECTED_SIDO", DEFAULT_MIN_EXPECTED_SIDO))
+    print(f"--- 실행 환경: {env}, dry_run={dry_run}, 최소 시군구={minimum_regions}, 최소 시도={minimum_sido} ---")
 
     try:
         db_host = os.getenv("DB_HOST")
@@ -120,7 +98,7 @@ def main():
         if env == "production":
             print("운영 환경으로 판단하여 RDS에 직접 접속합니다.")
             engine = create_db_engine(db_host, db_port, db_user, db_password, db_name)
-            collect_and_insert(engine, codes, dry_run=dry_run)
+            collect_and_insert(engine, dry_run=dry_run, minimum_regions=minimum_regions, minimum_sido=minimum_sido)
         else:
             print("로컬 환경으로 판단하여 SSH 터널링을 시작합니다.")
             from sshtunnel import SSHTunnelForwarder
@@ -140,11 +118,12 @@ def main():
                 print(f"SSH 터널이 생성되었습니다. (localhost:{local_port} -> {db_host}:{db_port})")
 
                 engine = create_db_engine('127.0.0.1', local_port, db_user, db_password, db_name)
-                collect_and_insert(engine, codes, dry_run=dry_run)
+                collect_and_insert(engine, dry_run=dry_run, minimum_regions=minimum_regions, minimum_sido=minimum_sido)
 
     except Exception as e:
         print(f"!! 전체 프로세스 실행 중 오류가 발생했습니다: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

@@ -7,7 +7,28 @@ on:
 
 # 실행될 작업(Job)들 정의
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # 수집 커버리지 가드가 살아 있는지 확인한다.
+      # 이 테스트가 깨진 채 배포되면 시도 단위 누락이 다시 조용히 지나간다.
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
   build-and-push:
+    needs: test
     # 작업이 실행될 가상 환경
     runs-on: ubuntu-latest
 

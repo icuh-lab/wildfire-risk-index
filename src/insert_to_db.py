@@ -5,24 +5,6 @@ from sqlalchemy import text
 TABLE_NAME = 'drought_impact_wildfire_risk_index'
 
 
-def extract_items(json_response):
-    items = json_response.get('response', {}).get('body', {}).get('items')
-
-    if not items:
-        return []
-
-    if isinstance(items, dict):
-        item = items.get('item', [])
-    else:
-        item = items
-
-    if isinstance(item, dict):
-        return [item]
-    if isinstance(item, list):
-        return item
-    return []
-
-
 def preprocess_asos_data(df):
     df = df.replace('', None)
 
@@ -54,21 +36,27 @@ def filter_existing_rows(df, engine, table_name):
         return df
 
     sigucodes = [int(code) for code in df['sigucode'].dropna().unique().tolist()]
-    analdates = df['analdate'].dropna().dt.strftime('%Y-%m-%d %H:%M:%S').unique().tolist()
+    analdates = df['analdate'].dropna()
 
-    if not sigucodes or not analdates:
+    if not sigucodes or analdates.empty:
         return df
 
+    # analdate는 정확히 일치하는 값을 SQL에서 나열하지 않고 범위로만 좁힌다.
+    # DB마다 datetime 저장 형태가 달라(예: 소수점 이하 자릿수) 문자열 동등 비교가 빗나갈 수 있는데,
+    # 최종 중복 판정은 아래 existing_keys 비교가 하므로 SQL은 후보를 넉넉히 걸러오기만 하면 된다.
+    start = analdates.min().strftime('%Y-%m-%d %H:%M:%S')
+    end = (analdates.max() + pd.Timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
+
     placeholders_codes = ', '.join(f':code_{idx}' for idx, _ in enumerate(sigucodes))
-    placeholders_dates = ', '.join(f':date_{idx}' for idx, _ in enumerate(analdates))
     params = {f'code_{idx}': code for idx, code in enumerate(sigucodes)}
-    params.update({f'date_{idx}': analdate for idx, analdate in enumerate(analdates)})
+    params.update({'start': start, 'end': end})
 
     query = text(f"""
         SELECT sigucode, analdate
         FROM {table_name}
         WHERE sigucode IN ({placeholders_codes})
-          AND analdate IN ({placeholders_dates})
+          AND analdate >= :start
+          AND analdate < :end
     """)
 
     try:
@@ -85,21 +73,14 @@ def filter_existing_rows(df, engine, table_name):
     return df[keep_mask]
 
 
-def insert_data_to_db(json_response, engine, dry_run=False):
-    """
-        JSON 응답을 받아 파싱, 전처리 후 데이터베이스에 삽입합니다.
-        """
+def insert_items_to_db(items, engine, dry_run=False):
+    """원천에서 받은 item 리스트를 전처리한 뒤 이미 있는 행을 걸러내고 적재한다."""
     try:
-        # 1. JSON에서 실제 데이터 리스트 추출
-        items = extract_items(json_response)
         if not items:
             print("데이터가 비어있습니다.")
             return 0
 
-        # 2. 리스트를 Pandas DataFrame으로 변환
         df = pd.DataFrame(items)
-
-        # 3. 데이터 전처리
         df_processed = preprocess_asos_data(df)
         df_new = filter_existing_rows(df_processed, engine, TABLE_NAME)
 
@@ -111,17 +92,13 @@ def insert_data_to_db(json_response, engine, dry_run=False):
             print(f"[DRY_RUN] {len(df_new)}개의 신규 데이터가 '{TABLE_NAME}' 테이블에 삽입될 예정입니다.")
             return len(df_new)
 
-        # 4. DataFrame을 SQL 테이블에 삽입
-        # table_name: 실제 DB에 생성할 테이블 이름
-        # if_exists='append': 테이블이 존재하면 데이터 추가 (다른 옵션: 'replace', 'fail')
-        # index=False: DataFrame의 index는 DB에 추가하지 않음
         df_new.to_sql(TABLE_NAME, con=engine, if_exists='append', index=False)
 
         print(f"{len(df_new)}개의 데이터가 '{TABLE_NAME}' 테이블에 성공적으로 삽입되었습니다.")
         return len(df_new)
 
     except (KeyError, TypeError) as e:
-        print(f"JSON 데이터 파싱 중 오류가 발생했습니다: {e}")
+        print(f"데이터 파싱 중 오류가 발생했습니다: {e}")
         return 0
     except Exception as e:
         print(f"데이터베이스 작업 중 오류가 발생했습니다: {e}")
