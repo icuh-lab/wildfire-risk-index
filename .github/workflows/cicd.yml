@@ -35,6 +35,10 @@ jobs:
     # 작업이 실행될 가상 환경
     runs-on: ubuntu-latest
 
+    # 배포 잡이 "방금 민 이미지가 맞는지" 대조할 수 있게 digest를 넘긴다.
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
     # 작업의 단계(Step)들
     steps:
       # 1. 레포지토리 코드 체크아웃
@@ -51,6 +55,7 @@ jobs:
 
       # 3. Docker 이미지 빌드 및 Docker Hub에 푸시
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -68,13 +73,31 @@ jobs:
       - name: Pull latest image on EC2
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ec2-54-180-165-127.ap-northeast-2.compute.amazonaws.com
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            set -e
+
+            # 어느 호스트에 붙었는지 로그에 남긴다. 배포 대상이 어긋나면 여기서 바로 보인다.
+            echo "배포 대상 호스트: $(hostname -f)"
+
             # Docker Hub에서 최신 이미지를 pull 받아 놓기만 한다.
             # 실행은 EC2의 Cron이 담당한다.
-            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
+            IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
+            sudo docker pull "$IMAGE"
+
+            # 방금 민 digest와 대조한다.
+            # pull이 성공해도 크론이 도는 호스트가 아니면 옛 이미지가 그대로 남는데,
+            # 2026-08-28에 실제로 그렇게 배포가 성공 표시된 채 반영되지 않았다.
+            EXPECTED="${{ needs.build-and-push.outputs.digest }}"
+            PULLED=$(sudo docker inspect -f '{{index .RepoDigests 0}}' "$IMAGE")
+            echo "기대 digest: $EXPECTED"
+            echo "실제 digest: $PULLED"
+            case "$PULLED" in
+              *"$EXPECTED"*) echo "이미지 반영 확인" ;;
+              *) echo "!! 이 호스트의 이미지가 방금 민 것과 다르다. 배포 대상 호스트를 확인해야 한다."; exit 1 ;;
+            esac
             
             # 2. GitHub Secrets의 값을 사용하여 EC2 서버에 .env 파일을 생성합니다.
             tee /home/ubuntu/.env <<EOF
