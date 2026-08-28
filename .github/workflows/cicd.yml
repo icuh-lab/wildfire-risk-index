@@ -4,6 +4,7 @@ name: wildfire-risk-index CI/CD Pipeline to using Docker Hub
 on:
   push:
     branches: [ "main" ] # main 브랜치에 push 될 때 실행
+  pull_request:          # PR에서는 test 잡만 돈다(아래 if로 빌드·배포를 막는다)
 
 # 실행될 작업(Job)들 정의
 jobs:
@@ -29,6 +30,8 @@ jobs:
 
   build-and-push:
     needs: test
+    # PR에서는 이미지를 밀지 않는다. main에 들어온 뒤에만 빌드·배포한다.
+    if: github.event_name == 'push'
     # 작업이 실행될 가상 환경
     runs-on: ubuntu-latest
 
@@ -58,6 +61,7 @@ jobs:
  # ===== 여기부터 배포 작업 추가 =====
   deploy:
     needs: build-and-push
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     steps:
